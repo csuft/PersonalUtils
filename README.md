@@ -18,5 +18,13 @@ The project is managed with CMake and I tried to make it compiled across platfor
 - generate Visual Studio projects with **CMake**
 - compile and test
 
+## Dependency
+- [OpenCV](http://opencv.org/)
+- [FFmpeg](http://ffmpeg.org/)
+- [googletest](https://github.com/google/googletest)
+
+## Compiling Issues
+> You should be careful about the type of code generation when linked with google test library. If you encountered a huge number of linking error, then maybe you mixed the option **/MT** and **/MD** because these two options are not compatible with each other.
+
 # License
 [MIT](https://mit-license.org/)
