@@ -6,6 +6,11 @@ PROJECT(OpenBase)
 # CMAKE search path
 SET(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_SOURCE_DIR}/cmake/Modules/")
 
+#################################################################
+# Compiler and Linker
+SET(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /MT")
+SET(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /MTd")
+
 INCLUDE_DIRECTORIES(${CMAKE_CURRENT_SOURCE_DIR}/include)
 LINK_DIRECTORIES(${CMAKE_CURRENT_SOURCE_DIR}/lib/gtest/${CMAKE_CFG_INTDIR}/)
 
