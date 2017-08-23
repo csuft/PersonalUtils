@@ -1,4 +1,5 @@
 # OBS Studio启动关键流程分析
+> 所分析代码版本为20.0.1，使用CMake生成Visual Studio工程进行编译
 
 OBS Studio启动流程从obs-app.cpp的main函数开始：
 ```c
@@ -81,7 +82,7 @@ for (int i = 1; i < argc; i++) {
     }
 }
 ```
-对命令行模式的参数进行解析，设置一些状态变量。如果不是从命令行启动的话，根本就不会执行这部分代码。
+对命令行模式的参数进行解析，设置一些状态变量。如果不是从命令行启动的话，可以在内部代码中直接修改这些变量。
 ```c
 #if !OBS_UNIX_STRUCTURE
 	if (!portable_mode) {
@@ -225,7 +226,7 @@ static bool update_ffmpeg_output(ConfigFile &config)
 	return true;
 }
 ```
-(2)短线重连配置
+(2)断线重连配置
 ```c
 static bool update_reconnect(ConfigFile &config)
 {
@@ -340,7 +341,7 @@ static bool MakeUserDirs()
 ```
 主要包括`obs-studio/basic`,`obs-studio/logs`,`obs-studio/profiler_data`,`obs-studio/plugin_config`,`obs-studio/crashes`,`obs-studio/updates`这几个文件夹。其中，最后两个文件夹只针对windows创建，因为和崩溃日志、程序更新相关，在mac上没有相关功能，因此使用了条件编译。
 
-`InitGlobalConfig`函数主要是创建`global.ini`文件。这个是全局配置文件，具体的代码就不细看了，反正就是设置各种默认值的。
+`InitGlobalConfig`函数主要是创建`global.ini`文件。这个是全局配置文件，具体的代码就不细看了，就是设置各种默认值的。
 `InitLocale`和国际化语言相关。
 `InitTheme`设置主题相关，其实是加载qss文件实现界面的自定义
 
@@ -407,7 +408,272 @@ bool OBSApp::OBSInit()
 	}
 }
 ```
-代码逻辑非常简单了，首先显示一个许可证对话框。当用户同意许可证时再继续往下初始化，否则程序就直接结束了。 如果用户同意了许可证，那么逻辑也很简单，首先调用OBSStartup()方法，然后初始化主窗口类OBSBasic。 OBSStarup()方法又包含一个非常庞大的执行逻辑。现在就慢慢来分析下：
+代码逻辑非常简单了，首先显示一个许可证对话框。当用户同意许可证时再继续往下初始化，否则程序就直接结束了。 如果用户同意了许可证，那么逻辑也很简单，首先调用`OBSStartup()`方法，然后初始化主窗口类`OBSBasic`。其中，`OBSStarup()`方法又包含一个非常庞大的执行逻辑。现在就慢慢来分析下：
+```c
+static bool StartupOBS(const char *locale, profiler_name_store_t *store)
+{
+	char path[512];
+
+	if (GetConfigPath(path, sizeof(path), "obs-studio/plugin_config") <= 0)
+		return false;
+
+	return obs_startup(locale, path, store);
+}
+```
+这个函数首先获取插件配置路径`obs-studio/plugin_config`，得到完整的路径后再传入`obs_startup()`方法。这个插件配置路径下是什么呢？在我的电脑上完整路径为`C:\Users\[user name]\AppData\Roaming\obs-studio\plugin_config`，其下包含几个文件夹：
+```bash
+C:.
+├─obs-browser
+│      Visited Links
+│
+├─rtmp-services
+│      meta.json
+│      package.json
+│      services.json
+│      twitch_ingests.json
+│
+├─text-freetype2
+└─win-capture
+        32.ini
+        64.ini
+```
+可以看到都是一些json格式的配置文件。至于其内容暂且不去关心，我们先接着继续往后看`obs_startup()`这个方法：
+```c
+bool obs_startup(const char *locale, const char *module_config_path,
+		profiler_name_store_t *store)
+{
+	bool success;
+
+	profile_start(obs_startup_name);
+
+	if (obs) {
+		blog(LOG_WARNING, "Tried to call obs_startup more than once");
+		return false;
+	}
+
+#ifdef _WIN32
+	initialize_crash_handler();
+	initialize_com();
+#endif
+
+	success = obs_init(locale, module_config_path, store);
+	profile_end(obs_startup_name);
+	if (!success)
+		obs_shutdown();
+
+	return success;
+}
+```
+`profile_start()`方法是用来做性能探查的，不用管他。然后通过判断`obs`这个全局变量是否初始化了来防止多次调用`obs_startup()`方法。针对Windows平台单独调用了两个方法`initialize_crash_handler()`和`initialize_com()`。`initialize_crash_handler()`方法定义如下：
+```c
+void initialize_crash_handler(void)
+{
+	static bool initialized = false;
+
+	if (!initialized) {
+		SetUnhandledExceptionFilter(exception_handler);
+		initialized = true;
+	}
+}
+```
+其实就是调用了`SetUnhandledExceptionFilter`方法，用于设置异常处理器。其参数`exception_handler`事实上是一个函数指针,当程序发生未捕获的异常时就会调用这个方法进行处理。其内部通过捕获异常参数记录到日志和剪贴板，实现崩溃日志的记录功能，方便开发者诊断崩溃原因。这个部分后面将专门写一篇博文来记录如何使用异常捕获记录崩溃日志。暂且略过，看到`initialize_com`方法：
+```c
+void initialize_com(void)
+{
+	CoInitializeEx(0, COINIT_MULTITHREADED);
+}
+```
+简单的要命，直接调用`CoInitializeEx()`方法初始化`COM`环境。然后，就再次进入了另外一个初始化函数`obs_init`方法：
+```c
+static bool obs_init(const char *locale, const char *module_config_path,
+		profiler_name_store_t *store)
+{
+	obs = bzalloc(sizeof(struct obs_core));
+
+	pthread_mutex_init_value(&obs->audio.monitoring_mutex);
+
+	obs->name_store_owned = !store;
+	obs->name_store = store ? store : profiler_name_store_create();
+	if (!obs->name_store) {
+		blog(LOG_ERROR, "Couldn't create profiler name store");
+		return false;
+	}
+
+	log_system_info();
+
+	if (!obs_init_data())
+		return false;
+	if (!obs_init_handlers())
+		return false;
+	if (!obs_init_hotkeys())
+		return false;
+
+	if (module_config_path)
+		obs->module_config_path = bstrdup(module_config_path);
+	obs->locale = bstrdup(locale);
+	obs_register_source(&scene_info);
+	add_default_module_paths();
+	return true;
+}
+```
+函数的开头就给全局变量`obs`分配了内存，这个变量在前面用于判断是否重复调用`obs_startup()`方法。后面与性能探查相关的代码就忽略掉，余下几个方法值得重点关注下：
+```c
+log_system_info();
+
+if (!obs_init_data())
+	return false;
+if (!obs_init_handlers())
+	return false;
+if (!obs_init_hotkeys())
+	return false;
+
+obs_register_source(&scene_info);
+add_default_module_paths();
+```
+首先来看看`log_system_info()`方法：
+```c
+void log_system_info(void)
+{
+	struct win_version_info ver;
+	get_win_ver(&ver);
+
+	win_ver = (ver.major << 8) | ver.minor;
+
+	log_processor_info();
+	log_processor_cores();
+	log_available_memory();
+	log_windows_version();
+	log_admin_status();
+	log_aero();
+}
+```
+逻辑很简单，首先判断Windows版本。因为部分功能只在高版本的Windows系统才能用，这里就记录下了系统版本供后面进行判断。然后几个方法都是记录系统软硬件信息（包括处理器、内存、系统版本、管理员权限、aero特效）到日志中，暂不关注具体实现。
+接下来看`obs_init_data`方法吧：
+```c
+static bool obs_init_data(void)
+{
+	struct obs_core_data *data = &obs->data;
+	pthread_mutexattr_t attr;
+
+	assert(data != NULL);
+
+	pthread_mutex_init_value(&obs->data.displays_mutex);
+	pthread_mutex_init_value(&obs->data.draw_callbacks_mutex);
+
+	if (pthread_mutexattr_init(&attr) != 0)
+		return false;
+	if (pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE) != 0)
+		goto fail;
+	if (pthread_mutex_init(&data->sources_mutex, &attr) != 0)
+		goto fail;
+	if (pthread_mutex_init(&data->audio_sources_mutex, &attr) != 0)
+		goto fail;
+	if (pthread_mutex_init(&data->displays_mutex, &attr) != 0)
+		goto fail;
+	if (pthread_mutex_init(&data->outputs_mutex, &attr) != 0)
+		goto fail;
+	if (pthread_mutex_init(&data->encoders_mutex, &attr) != 0)
+		goto fail;
+	if (pthread_mutex_init(&data->services_mutex, &attr) != 0)
+		goto fail;
+	if (pthread_mutex_init(&obs->data.draw_callbacks_mutex, NULL) != 0)
+		goto fail;
+	if (!obs_view_init(&data->main_view))
+		goto fail;
+
+	data->valid = true;
+
+fail:
+	pthread_mutexattr_destroy(&attr);
+	return data->valid;
+}
+```
+这一堆代码基本上都是在初始化互斥量mutex。而这些互斥量都存储在前面介绍的`obs`结构体中的`data`域。`obs`是一个全局变量，其类型为`struct obs_core`:
+```c
+struct obs_core {
+	struct obs_module               *first_module;
+	DARRAY(struct obs_module_path)  module_paths;
+	DARRAY(struct obs_source_info)  source_types;
+	DARRAY(struct obs_source_info)  input_types;
+	DARRAY(struct obs_source_info)  filter_types;
+	DARRAY(struct obs_source_info)  transition_types;
+	DARRAY(struct obs_output_info)  output_types;
+	DARRAY(struct obs_encoder_info) encoder_types;
+	DARRAY(struct obs_service_info) service_types;
+	DARRAY(struct obs_modal_ui)     modal_ui_callbacks;
+	DARRAY(struct obs_modeless_ui)  modeless_ui_callbacks;
+
+	signal_handler_t                *signals;
+	proc_handler_t                  *procs;
+
+	char                            *locale;
+	char                            *module_config_path;
+	bool                            name_store_owned;
+	profiler_name_store_t           *name_store;
+
+	/* segmented into multiple sub-structures to keep things a bit more
+	 * clean and organized */
+	struct obs_core_video           video;
+	struct obs_core_audio           audio;
+	struct obs_core_data            data;
+	struct obs_core_hotkeys         hotkeys;
+};
+```
+这个结构体比较庞大，成员数众多。首先以DARRAY宏声明了一些动态数组，类型包括了`OBS`中的一些抽象对象，如`obs_module_path`, `obs_source_info`, `obs_output_info`,`obs_encoder_info`,`obs_service_info`等。`DARRAY`宏其实是一个联合体类型：
+```c
+#define DARRAY(type)        \
+    union {                 \
+        struct darray da;   \
+        struct {            \
+            type *array;     \
+            size_t num;      \
+            size_t capacity; \
+        };                   \
+    }
+```
+而`darray`的定义如下：
+```c
+struct darray {
+	void *array;
+	size_t num;
+	size_t capacity;
+};
+```
+因此，这个联合体中的两种定义其实是一样的，只不过这种方法可以让用户以不同的名字来使用而已。到这里就明白了，`DARRAY`在`obs_core`结构体中声明了多个结构体成员，包括`source`, `output`, `encoder`等。在`obs_core`结构体定义的末尾，把视频、音频、快捷键、核心数据又分割成了多个结构体：
+```c
+struct obs_core_video           video;
+struct obs_core_audio           audio;
+struct obs_core_data            data;
+struct obs_core_hotkeys         hotkeys;
+```
+作者的说法是，这样分开维护保持了简洁可读性。确实，如果都在这个结构体中定义的话，结构体的成员数将会爆炸。到这里我们已经岔开够远了。还是回到`obs_init`方法中看看`obs_init_handlers`：
+```c
+static inline bool obs_init_handlers(void)
+{
+	obs->signals = signal_handler_create();
+	if (!obs->signals)
+		return false;
+
+	obs->procs   = proc_handler_create();
+	if (!obs->procs)
+		return false;
+
+	return signal_handler_add_array(obs->signals, obs_signals);
+}
+```
+主要是创建了`signal`处理器和`proc`处理器并赋值给`obs_core`结构体中的`signals`和`procs`成员。其作用不明，暂不深究。`obs_init_hotkeys`显然是处理快捷键的方法。由于快捷键对于实际功能并不影响，因此我们在这里分析的时候不去关心具体的实现方法。再回到`OBSInit`方法，看看主窗口类`OBSBasic`的初始化和创建吧。`OBSBasic`类的构造函数中主要是界面相关的代码，包括窗口布局、快捷键处理、信号与槽连接等代码，比较杂乱。我们更关心底层的代码功能在`OBSInit`方法。
+一层套一层的调用，往往让人头晕目眩，一眼无法看穿代码的真实意图。
+
+
+
+
+
+
+
+
+
+
+
 
 
 
